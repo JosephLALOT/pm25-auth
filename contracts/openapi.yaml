@@ -1,0 +1,705 @@
+openapi: 3.0.3
+
+info:
+  title: PM2.5 Auth API
+  version: 0.1.0
+  description: |
+    Public contract of `pm25-auth`, the authentication service of the PM2.5 platform.
+    It manages user accounts, issues access and refresh tokens, and publishes the public
+    keys that `pm25-api` uses to verify access tokens. It is used by the website
+    (`pm25-web`) and the Android app, and is the source of truth for the Go and
+    TypeScript types.
+
+    ## Conventions
+
+    - **JSON only**, `snake_case` field names.
+    - **Times:** ISO 8601 in UTC, e.g. `2026-11-15T09:00:00Z`.
+    - **Missing values:** an optional field is omitted when its value is not available.
+      Fields are never `null`.
+    - **Paginated lists:** `?page=1&page_size=50`, response
+      `{ "items": [...], "page": 1, "page_size": 50, "total": 123 }`.
+    - **Request id:** every response carries an `X-Request-Id` header, also written in the
+      logs of the request.
+    - **Versioning:** breaking changes only in a new `/api/v2`.
+
+    ## Errors
+
+    Every error uses the `Error` schema: `{ "error": { "code": "...", "message": "..." } }`.
+
+    | Status | Code | When |
+    |---|---|---|
+    | 400 | `VALIDATION_ERROR` | Invalid request body or query parameter |
+    | 401 | `INVALID_CREDENTIALS` | Login failed: unknown e-mail, wrong password or inactive account |
+    | 401 | `UNAUTHORIZED` | Missing, invalid or expired access token, or invalid refresh token |
+    | 403 | `FORBIDDEN` | Valid token, but the role is not allowed |
+    | 404 | `NOT_FOUND` | Unknown user |
+    | 409 | `EMAIL_TAKEN` | An account already uses this e-mail |
+    | 429 | `RATE_LIMITED` | Too many requests from this IP address |
+    | 500 | `INTERNAL` | Unexpected server error |
+
+    ## Tokens
+
+    **Access token:** JWT signed with EdDSA (Ed25519), valid 15 minutes, sent as
+    `Authorization: Bearer <token>` to `pm25-auth` and `pm25-api`.
+
+    - Header: `alg: EdDSA`, `typ: JWT`, `kid` (identifier of the signing key).
+    - Claims: `iss` (`https://pm25-auth.alwaysdata.net`), `aud` (`pm25-api`), `sub` (user
+      id), `role` (`user` or `admin`), `iat`, `exp`.
+    - Verifiers fetch the public keys from `/.well-known/jwks.json`, accept only `EdDSA`,
+      and check `iss`, `aud` and `exp`.
+
+    **Refresh token:** opaque random string, valid 7 days, only usable with
+    `/auth/refresh` and `/auth/logout`. It is rotated on every refresh: the old one stops
+    working.
+
+    **Storage on clients:** the website keeps the access token in memory and the refresh
+    token in `localStorage`; the Android app keeps both in EncryptedSharedPreferences.
+    On a `401` from either service, clients refresh once, then retry the request.
+
+    **Role changes** take effect at the next refresh, so after 15 minutes at most.
+
+servers:
+  - url: https://pm25-auth.alwaysdata.net/api/v1
+    description: Production (alwaysdata)
+  - url: http://localhost:8001/api/v1
+    description: Local development (docker-compose)
+
+security: []
+
+tags:
+  - name: system
+    description: Service status and public keys
+  - name: auth
+    description: Registration, login and tokens
+  - name: account
+    description: Signed-in user
+  - name: admin
+    description: User management, role `admin` only
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      operationId: getHealth
+      summary: Service status
+      description: |
+        Status of the service, its database and its active signing key. Answers `200`
+        when the service is usable and `503` when the database is unreachable.
+      responses:
+        "200":
+          description: The service is usable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+        "503":
+          description: The database is unreachable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Health"
+
+  /.well-known/jwks.json:
+    servers:
+      - url: https://pm25-auth.alwaysdata.net
+        description: Production (outside `/api/v1`)
+      - url: http://localhost:8001
+        description: Local development (outside `/api/v1`)
+    get:
+      tags: [system]
+      operationId: getJwks
+      summary: Public signing keys
+      description: |
+        Public keys used to verify access tokens (RFC 7517, Ed25519 keys as defined by
+        RFC 8037): the active key and, during a rotation, the previous one. Served outside
+        `/api/v1` and cacheable for 5 minutes.
+      responses:
+        "200":
+          description: Current public keys
+          headers:
+            Cache-Control:
+              description: Always `public, max-age=300`.
+              schema:
+                type: string
+                example: public, max-age=300
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Jwks"
+
+  /auth/register:
+    post:
+      tags: [auth]
+      operationId: register
+      summary: Create an account
+      description: |
+        Creates an account with the role `user`. Admins are never created through the API:
+        the first one is created on the server with `pm25-auth create-admin`. The e-mail is
+        stored in lower case. Registration does not log the user in: call `/auth/login`
+        next.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RegisterRequest"
+      responses:
+        "201":
+          description: Account created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "409":
+          $ref: "#/components/responses/EmailTaken"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/Internal"
+
+  /auth/login:
+    post:
+      tags: [auth]
+      operationId: login
+      summary: Log in
+      description: |
+        Checks the e-mail (case-insensitive) and the password, then returns a new access
+        token and a new refresh token. The same error is returned for an unknown e-mail, a
+        wrong password and an inactive account, so the response does not reveal which
+        accounts exist.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Logged in
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/InvalidCredentials"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/Internal"
+
+  /auth/refresh:
+    post:
+      tags: [auth]
+      operationId: refresh
+      summary: Get a new token pair
+      description: |
+        Exchanges a valid refresh token for a new access token and a new refresh token.
+        The refresh token sent is revoked: keep only the new one. Fails if the refresh
+        token is unknown, expired or revoked, or if the account has been deactivated.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshTokenRequest"
+      responses:
+        "200":
+          description: New token pair
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TokenPair"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/InvalidRefreshToken"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/Internal"
+
+  /auth/logout:
+    post:
+      tags: [auth]
+      operationId: logout
+      summary: Log out
+      description: |
+        Revokes the refresh token. Always answers `204`, even if the token is unknown or
+        already revoked. The access token stays valid until it expires (15 minutes at most);
+        clients delete both tokens.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RefreshTokenRequest"
+      responses:
+        "204":
+          description: Logged out
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/Internal"
+
+  /me:
+    get:
+      tags: [account]
+      operationId: getMe
+      summary: Current user
+      description: Account of the user identified by the access token.
+      security:
+        - bearerAuth: []
+      responses:
+        "200":
+          description: Current user
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/Internal"
+
+  /admin/users:
+    get:
+      tags: [admin]
+      operationId: adminListUsers
+      summary: List users
+      description: |
+        Users, latest created first. With `ids`, only these users are returned: the
+        back-office uses it to show the e-mails of the admins found in the audit trail and
+        the collection runs of `pm25-api`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/Page"
+        - $ref: "#/components/parameters/PageSize"
+        - name: ids
+          in: query
+          required: false
+          description: Comma-separated user ids, e.g. `?ids=<uuid>,<uuid>`.
+          style: form
+          explode: false
+          schema:
+            type: array
+            minItems: 1
+            maxItems: 100
+            items:
+              type: string
+              format: uuid
+      responses:
+        "200":
+          description: One page of users
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UserPage"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/Internal"
+
+  /admin/users/{id}:
+    patch:
+      tags: [admin]
+      operationId: adminUpdateUser
+      summary: Change the role or status of a user
+      description: |
+        Changes only the fields sent. Users are never deleted, only deactivated.
+
+        - A role change takes effect at the user's next refresh (15 minutes at most).
+        - A deactivated user can no longer log in or refresh; their current access token
+          stays valid until it expires.
+        - An admin cannot change their own role or status (`403 FORBIDDEN`), so the last
+          admin cannot lock everyone out.
+
+        Recorded in the audit trail of the platform.
+      security:
+        - bearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: User id.
+          schema:
+            type: string
+            format: uuid
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UserUpdate"
+      responses:
+        "200":
+          description: User updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/User"
+        "400":
+          $ref: "#/components/responses/ValidationError"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/UserNotFound"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          $ref: "#/components/responses/Internal"
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Access token returned by `/auth/login` or `/auth/refresh`.
+
+  parameters:
+    Page:
+      name: page
+      in: query
+      required: false
+      description: Page number, starting at 1.
+      schema:
+        type: integer
+        minimum: 1
+        default: 1
+    PageSize:
+      name: page_size
+      in: query
+      required: false
+      description: Number of items per page.
+      schema:
+        type: integer
+        minimum: 1
+        maximum: 100
+        default: 50
+
+  responses:
+    ValidationError:
+      description: Invalid request body or query parameter.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: VALIDATION_ERROR
+              message: "password must be at least 10 characters"
+    InvalidCredentials:
+      description: Unknown e-mail, wrong password or inactive account.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: INVALID_CREDENTIALS
+              message: "Invalid e-mail or password"
+    InvalidRefreshToken:
+      description: The refresh token is unknown, expired or revoked, or the account is inactive.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: "Invalid refresh token"
+    Unauthorized:
+      description: Missing, invalid or expired access token.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: UNAUTHORIZED
+              message: "Access token expired"
+    Forbidden:
+      description: The access token is valid, but the action is not allowed for this user.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: FORBIDDEN
+              message: "Admin role required"
+    UserNotFound:
+      description: No user has this id.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: NOT_FOUND
+              message: "Unknown user"
+    EmailTaken:
+      description: An account already uses this e-mail.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: EMAIL_TAKEN
+              message: "This e-mail is already registered"
+    RateLimited:
+      description: Too many requests from this IP address.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: RATE_LIMITED
+              message: "Too many requests"
+    Internal:
+      description: Unexpected server error.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: INTERNAL
+              message: "Internal error"
+
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              enum:
+                - VALIDATION_ERROR
+                - INVALID_CREDENTIALS
+                - UNAUTHORIZED
+                - FORBIDDEN
+                - NOT_FOUND
+                - EMAIL_TAKEN
+                - RATE_LIMITED
+                - INTERNAL
+              example: INVALID_CREDENTIALS
+            message:
+              type: string
+              description: Human-readable explanation, for logs and debugging.
+              example: "Invalid e-mail or password"
+
+    Health:
+      type: object
+      required: [status, database]
+      properties:
+        status:
+          type: string
+          description: "`ok` when the service is usable, `down` when the database is unreachable."
+          enum: [ok, down]
+          example: ok
+        database:
+          type: object
+          required: [reachable]
+          properties:
+            reachable:
+              type: boolean
+              example: true
+        kid:
+          type: string
+          description: Identifier of the active signing key. Omitted if no key is configured.
+          example: "2026-11"
+
+    Jwk:
+      type: object
+      description: Ed25519 public key (RFC 8037).
+      required: [kty, crv, x, kid, use, alg]
+      properties:
+        kty:
+          type: string
+          enum: [OKP]
+          example: OKP
+        crv:
+          type: string
+          enum: [Ed25519]
+          example: Ed25519
+        x:
+          type: string
+          description: Public key, base64url without padding.
+          example: 11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo
+        kid:
+          type: string
+          description: Key identifier, matched against the `kid` header of access tokens.
+          example: "2026-11"
+        use:
+          type: string
+          enum: [sig]
+          example: sig
+        alg:
+          type: string
+          enum: [EdDSA]
+          example: EdDSA
+
+    Jwks:
+      type: object
+      required: [keys]
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/Jwk"
+
+    Role:
+      type: string
+      enum: [user, admin]
+      example: user
+
+    User:
+      type: object
+      required: [id, email, display_name, role, is_active, created_at]
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: User id, also the `sub` claim of the access token.
+          example: 3f1c2a9e-8b7d-4c1e-9a2b-6d5e4f3a2b1c
+        email:
+          type: string
+          format: email
+          description: Stored in lower case.
+          example: an.nguyen@example.com
+        display_name:
+          type: string
+          example: An Nguyen
+        role:
+          $ref: "#/components/schemas/Role"
+        is_active:
+          type: boolean
+          description: Inactive users cannot log in or refresh.
+          example: true
+        created_at:
+          type: string
+          format: date-time
+          example: "2026-11-15T09:00:00Z"
+        last_login_at:
+          type: string
+          format: date-time
+          description: Omitted if the user never logged in.
+          example: "2026-11-15T09:05:00Z"
+
+    UserPage:
+      type: object
+      required: [items, page, page_size, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/User"
+        page:
+          type: integer
+          minimum: 1
+          example: 1
+        page_size:
+          type: integer
+          minimum: 1
+          example: 50
+        total:
+          type: integer
+          minimum: 0
+          example: 12
+
+    RegisterRequest:
+      type: object
+      required: [email, password, display_name]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          example: an.nguyen@example.com
+        password:
+          type: string
+          format: password
+          minLength: 10
+          maxLength: 128
+          example: correct-horse-battery
+        display_name:
+          type: string
+          minLength: 1
+          maxLength: 64
+          example: An Nguyen
+
+    LoginRequest:
+      type: object
+      required: [email, password]
+      properties:
+        email:
+          type: string
+          format: email
+          maxLength: 254
+          example: an.nguyen@example.com
+        password:
+          type: string
+          format: password
+          maxLength: 128
+          example: correct-horse-battery
+
+    RefreshTokenRequest:
+      type: object
+      required: [refresh_token]
+      properties:
+        refresh_token:
+          type: string
+          minLength: 1
+          example: 5mQy8c1v2Q0bS7wq6m2v0kQd3n9fJx4tR8pL1aZcE6g
+
+    TokenPair:
+      type: object
+      required: [access_token, refresh_token, expires_in]
+      properties:
+        access_token:
+          type: string
+          description: "JWT, sent as `Authorization: Bearer <access_token>`."
+          example: eyJhbGciOiJFZERTQSIsImtpZCI6IjIwMjYtMTEiLCJ0eXAiOiJKV1QifQ.eyJzdWIiOiIzZjFjMmE5ZSJ9.c2lnbmF0dXJl
+        refresh_token:
+          type: string
+          description: Opaque token for `/auth/refresh` and `/auth/logout`, valid 7 days.
+          example: 5mQy8c1v2Q0bS7wq6m2v0kQd3n9fJx4tR8pL1aZcE6g
+        expires_in:
+          type: integer
+          description: Lifetime of the access token, in seconds.
+          example: 900
+
+    UserUpdate:
+      type: object
+      minProperties: 1
+      description: Fields to change; at least one.
+      properties:
+        role:
+          $ref: "#/components/schemas/Role"
+        is_active:
+          type: boolean
+          example: false
