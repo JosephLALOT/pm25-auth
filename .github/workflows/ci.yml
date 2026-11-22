@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: pm25_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/pm25_test?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: gofmt
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then echo "$unformatted"; exit 1; fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go test (with PostgreSQL)
+        run: go test -race -count=1 ./...
+
+      - name: Migrations up, down, up on an empty database
+        env:
+          PGPASSWORD: postgres
+        run: |
+          psql -h localhost -U postgres -c 'CREATE DATABASE migrate_check'
+          url='postgres://postgres:postgres@localhost:5432/migrate_check?sslmode=disable&x-migrations-table=auth_schema_migrations'
+          migrate() { docker run --rm --network host -v "$PWD/db/migrations:/migrations:ro" migrate/migrate:v4.18.1 -path /migrations -database "$url" "$@"; }
+          migrate up
+          migrate down -all
+          migrate up
+
+      - name: Docker image builds
+        run: docker build -t pm25-auth .
